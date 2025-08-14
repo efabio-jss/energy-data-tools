@@ -1,58 +1,96 @@
-# ⚡ E-REDES Substation Data Extractor
+PT Substations Updater & KMZ Generator
 
-This Python script connects to the **E-REDES Open Data API** to retrieve data about reception capacity from substations across Portugal. It allows optional filtering by substation name and optionally exports results to Excel.
+Fetch current reception capacity from E-Redes’ open data API, update your Excel workbook, export audit CSVs, and generate a Google Earth KMZ with custom ON/OFF icons based on Available Capacity.
 
----
+Script: ptsubs_plus_v2.py
+Data source (public): E-Redes / Opendatasoft dataset capacidade-rececao-rnd
 
-## ✅ Key Features
+____________________________________________________________________________________________________________________________________________________________________
 
-- Connects to:
-  - `https://e-redes.opendatasoft.com/api/explore/v2.1/catalog/datasets/capacidade-rececao-rnd/records`
-- Optionally filter by installation (`instalacao`)
-- Loads results into a Pandas DataFrame
-- Interactive option to save results as an Excel file
+What it does:
 
----
+Downloads records from E-Redes (with pagination).
 
-## 📥 User Inputs
+Normalizes & matches your rows by Substation + Municipality + District
+(ignores accents, case, punctuation, and parenthesis content).
 
-- **Substation name (optional):** Leave blank to get all records.
-- **Export to Excel?** Confirm via prompt (`y/n`)
+Updates the Excel columns Capacity and Available Capacity where a match is found.
 
----
+Reports unmatched rows (count + list) to the terminal and writes them to CSV.
 
-## 💾 Output
+Exports CSV with before/after values for all rows that changed.
 
-If exported, the file will be saved as:
-substation_data.xlsx
+Generates a KMZ:
 
-It will contain all fields provided by the API.
+uses ON.png for Available Capacity > 0
 
----
+uses of.png for Available Capacity == 0
 
-## ⚙️ How It Works
+converts Latitude/Longitude in DMS to decimal degrees if needed
 
-1. Prompts the user for a substation name.
-2. Sends a filtered or unfiltered API request.
-3. Converts results to a DataFrame.
-4. Displays and optionally saves results to Excel.
+placemark name = Substation; balloon shows Substation, Available Capacity, coordinates.
 
----
+____________________________________________________________________________________________________________________________________________________________________
 
-## 🔐 Requirements
+Requirements:
 
-- Python 3.x
-- Install dependencies:
-```bash
-pip install pandas requests openpyxl
+Python 3.9+
 
-📌 Notes
-By default, the API returns up to 100 records.
-For more data, implement pagination or modify query parameters.
+Packages:
 
+pandas
 
-🧠 Use Cases
-Identify substations and reception capacity across Portugal.
-Feed GIS or energy feasibility tools with official substation data.
-Support analysis and infrastructure planning.
+requests
 
+openpyxl (Excel I/O)
+
+____________________________________________________________________________________________________________________________________________________________________
+
+Outputs:
+
+Excel updated in place (with optional --backup).
+
+CSV audit files (in --csv_dir or next to the Excel):
+
+PT SUBS FINAL_updated_rows.csv
+Columns: Substation, Municipality, District, Capacity_before, Capacity_after, Available_before, Available_after.
+
+PT SUBS FINAL_unmatched.csv
+Rows that did not match any API record.
+
+KMZ (default PT_SUBS.kmz):
+
+placemark name: Substation
+
+balloon shows Substation, Available Capacity, decimal Latitude, decimal Longitude
+
+icon: ON.png if Available > 0; of.png otherwise
+
+includes the PNGs inside the KMZ, so the file is self-contained.
+
+____________________________________________________________________________________________________________________________________________________________________
+
+Coordinates
+
+Accepts decimal or DMS (e.g., 38° 46' 45.44" N, 9° 06' 08" W).
+
+Longitude without hemisphere is assumed West (negative) for Portugal.
+
+KMZ writes coordinates in decimal.
+
+Console report
+
+At the end you’ll see:
+
+number of updated rows
+
+number of unmatched rows
+
+printed list of unmatched as Substation | Municipality | District
+
+____________________________________________________________________________________________________________________________________________________________________
+
+Data source
+
+E-Redes / Opendatasoft: dataset capacidade-rececao-rnd (public).
+The script uses the v2.1 Explore API and paginates (limit/offset) to fetch all records.
