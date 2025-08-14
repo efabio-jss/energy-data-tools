@@ -64,9 +64,3 @@ The attribution method make_Attrib(const) indicates that the value was set as a 
 
 📌 Data Source
 Based on the SciGRID_gas EMAP dataset and visual references from ENTSOG/GIE system capacity maps.
-
-🔒 License
-See the LICENSE file included with the original dataset for data licensing.
-
-🙏 Acknowledgments
-This tool was developed with support from Universal Kraft for analysis and visualization of European gas infrastructure.
