@@ -4,7 +4,7 @@ import zipfile
 import json
 import os
 
-# Diretório de saída (pode ser modificado conforme necessário)
+
 output_dir = "output"
 os.makedirs(output_dir, exist_ok=True)
 
@@ -13,13 +13,13 @@ geojson_lines = os.path.join(output_dir, "transmission_lines_data.geojson")
 kml_file = os.path.join(output_dir, "canada_grid.kml")
 kmz_file = os.path.join(output_dir, "canada_grid.kmz")
 
-# URLs das camadas do ArcGIS Online
+
 urls = {
     "projects": "https://services5.arcgis.com/6czaFAhUmpKiwuMe/arcgis/rest/services/Projects_Upload/FeatureServer/0/query",
     "transmission_lines": "https://services5.arcgis.com/6czaFAhUmpKiwuMe/arcgis/rest/services/AIES_Transmission_Lines_View_Layer/FeatureServer/0/query"
 }
 
-# Parâmetros para obter os dados em formato GeoJSON
+
 params = {"where": "1=1", "outFields": "*", "f": "geojson"}
 
 def download_data(url, filepath):
@@ -31,11 +31,11 @@ def download_data(url, filepath):
     else:
         print(f"❌ Error fetching data: {response.status_code}")
 
-# Baixar dados
+
 download_data(urls["projects"], geojson_projects)
 download_data(urls["transmission_lines"], geojson_lines)
 
-# Criar novo KML
+
 kml = simplekml.Kml()
 
 def detect_voltage_field(geojson_file):
