@@ -1,0 +1,505 @@
+import sys
+import io
+import tempfile
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFileDialog, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QComboBox, QProgressBar, QTextEdit, QTableView, QFrame
+)
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineSettings
+
+import pandas as pd
+from shapely.geometry import shape
+from shapely.ops import unary_union
+from fastkml import kml as fastkml
+import plotly.graph_objects as go
+
+
+
+def apply_dark_theme(app: QApplication):
+    palette = QtGui.QPalette()
+    bg = QtGui.QColor(18, 18, 20)
+    panel = QtGui.QColor(24, 24, 28)
+    text = QtGui.QColor(230, 230, 235)
+    disabled_text = QtGui.QColor(130, 130, 140)
+    highlight = QtGui.QColor(80, 140, 255)
+
+    palette.setColor(QtGui.QPalette.Window, bg)
+    palette.setColor(QtGui.QPalette.WindowText, text)
+    palette.setColor(QtGui.QPalette.Base, panel)
+    palette.setColor(QtGui.QPalette.AlternateBase, bg)
+    palette.setColor(QtGui.QPalette.ToolTipBase, panel)
+    palette.setColor(QtGui.QPalette.ToolTipText, text)
+    palette.setColor(QtGui.QPalette.Text, text)
+    palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled_text)
+    palette.setColor(QtGui.QPalette.Button, panel)
+    palette.setColor(QtGui.QPalette.ButtonText, text)
+    palette.setColor(QtGui.QPalette.BrightText, Qt.white)
+    palette.setColor(QtGui.QPalette.Highlight, highlight)
+    palette.setColor(QtGui.QPalette.HighlightedText, Qt.black)
+    app.setPalette(palette)
+
+    app.setStyleSheet(
+        """
+        QWidget { font-family: 'Segoe UI','Inter', sans-serif; font-size: 12.5px; color: #E6E6EB; }
+        QMainWindow { background: #121214; }
+        QLabel { color: #DADAE0; }
+
+        /* Cartão (frame) */
+        .CardFrame {
+            background: #18181C;
+            border: 1px solid #2A2A31;
+            border-radius: 10px;
+        }
+        .CardHeader {
+            color: #C7CBD6;
+            background: #121214;
+            padding: 4px 10px;
+            margin-left: 6px;
+            margin-bottom: 6px;
+            border-radius: 6px;
+            font-weight: 600;
+            letter-spacing: .3px;
+        }
+
+        QPushButton { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2A2F3A, stop:1 #1F2230); color:#E6E6EB; border:1px solid #313544; border-radius:10px; padding:8px 14px; }
+        QPushButton:hover { border-color:#508CFF; }
+        QPushButton:pressed { background:#232634; }
+
+        QComboBox, QLineEdit { background:#1C1F2A; border:1px solid #2E3342; border-radius:8px; padding:6px 8px; }
+        QComboBox QAbstractItemView { background:#191B24; selection-background-color:#2A2E3D; }
+
+        QTextEdit { background:#14161D; border:1px solid #2A2F3A; border-radius:8px; }
+
+        QTableView { gridline-color:#2A2A31; background:#14161D; alternate-background-color:#171A22; border:1px solid #2A2F3A; border-radius:8px; }
+        QHeaderView::section { background:#1B1E27; color:#C7CBD6; padding:6px; border:0; border-right:1px solid #2A2F3A; }
+
+        QProgressBar { border:1px solid #313544; border-radius:8px; background:#1A1D27; text-align:center; }
+        QProgressBar::chunk { border-radius:8px; background:qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2A77FF, stop:1 #61E1FF); }
+        """
+    )
+
+
+
+class SectionCard(QWidget):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        self.header = QLabel(title)
+        self.header.setObjectName("CardHeader")
+        self.header.setProperty("class", "CardHeader")
+
+        self.frame = QFrame()
+        self.frame.setObjectName("CardFrame")
+        self.frame.setProperty("class", "CardFrame")
+        self.frame.setFrameShape(QFrame.NoFrame)
+        self.frame.setFrameShadow(QFrame.Plain)
+
+        inner = QVBoxLayout(self.frame)
+        inner.setContentsMargins(12, 12, 12, 12)
+        inner.setSpacing(8)
+        self._inner_layout = inner
+
+        outer.addWidget(self.header, 0, Qt.AlignLeft)
+        outer.addWidget(self.frame, 1)
+
+    def addWidget(self, w: QWidget):
+        self._inner_layout.addWidget(w)
+
+    def layoutInner(self):
+        return self._inner_layout
+
+    def setTitle(self, title: str):
+        self.header.setText(title)
+
+
+
+def _load_shapes_from_kmz_kml(path: str):
+    data = None
+    p = Path(path)
+    try:
+        if p.suffix.lower() == ".kmz":
+            import zipfile
+            with zipfile.ZipFile(path, "r") as zf:
+                kml_name = None
+                for name in zf.namelist():
+                    if name.lower().endswith(".kml"):
+                        kml_name = name
+                        if name.lower().endswith("doc.kml"):
+                            break
+                if not kml_name:
+                    return []
+                data = zf.read(kml_name)
+        else:
+            with open(path, "rb") as f:
+                data = f.read()
+    except Exception:
+        return []
+    k = fastkml.KML()
+    try:
+        k.from_string(data)
+    except Exception:
+        return []
+    polys = []
+    def walk(feat):
+        for f in getattr(feat, "features", []):
+            if hasattr(f, "geometry") and f.geometry is not None:
+                try:
+                    g = shape(f.geometry.__geo_interface__)
+                    if g.geom_type in ("Polygon", "MultiPolygon"):
+                        polys.append(g)
+                except Exception:
+                    pass
+            walk(f)
+    walk(k)
+    return polys
+
+
+
+class PandasModel(QtCore.QAbstractTableModel):
+    def __init__(self, df=pd.DataFrame(), parent=None):
+        super().__init__(parent)
+        self._df = df.copy()
+    def rowCount(self, parent=None):  # noqa
+        return 0 if parent and parent.isValid() else len(self._df.index)
+    def columnCount(self, parent=None):  # noqa
+        return 0 if parent and parent.isValid() else len(self._df.columns)
+    def data(self, index, role=Qt.DisplayRole):  # noqa
+        if not index.isValid(): return None
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            v = self._df.iat[index.row(), index.column()]
+            if isinstance(v, float):
+                return f"{v:,.4f}" if abs(v) < 1000 else f"{v:,.2f}"
+            return str(v)
+        return None
+    def headerData(self, section, orientation, role=Qt.DisplayRole):  # noqa
+        if role != Qt.DisplayRole: return None
+        return str(self._df.columns[section]) if orientation == Qt.Horizontal else str(self._df.index[section])
+    def setDataFrame(self, df):
+        self.beginResetModel(); self._df = df.copy(); self.endResetModel()
+
+
+
+def _donut_html(area_slope: float, area_env: float, area_usable: float,
+                width=520, height=360) -> str:
+    labels = ["Slope (red)", "Environmental (purple)", "Usable (green)"]
+    values = [max(area_slope, 0.0), max(area_env, 0.0), max(area_usable, 0.0)]
+    colors = ["#FF4D4F", "#9B59B6", "#27AE60"]
+    fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.62, textinfo="value+percent")])
+    fig.update_traces(marker=dict(colors=colors, line=dict(color="#0E1014", width=2)))
+    fig.update_layout(
+        width=width, height=height,
+        paper_bgcolor="#121214", plot_bgcolor="#121214",
+        font=dict(color="#E6E6EB"), showlegend=False,
+        margin=dict(l=14, r=14, t=14, b=14)
+    )
+    inner = fig.to_html(full_html=False, include_plotlyjs=True)
+    html = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  html,body{{background:#121214;margin:0;overflow:hidden}}
+  #wrap{{background:#121214;padding:0;margin:0}}
+</style>
+</head>
+<body><div id="wrap">{inner}</div></body>
+</html>"""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+    with open(tmp.name, "w", encoding="utf-8") as f:
+        f.write(html)
+    return tmp.name
+
+
+
+class EvalWorker(QtCore.QThread):
+    line = Signal(str)
+    started_eval = Signal()
+    finished_eval = Signal(bool, dict)
+
+    def __init__(self, kmz_path: str, slope_percent: int = 10, parent=None):
+        super().__init__(parent)
+        self.kmz_path = kmz_path
+        self.slope_percent = slope_percent
+
+    def run(self):
+        buf = io.StringIO()
+        class Tee(io.TextIOBase):
+            def write(self_inner, s):
+                buf.write(s)
+                self.line.emit(s.rstrip())
+                return len(s)
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = Tee()
+
+        success = False
+        paths = {}
+        try:
+            import importlib
+            if "eva001" in sys.modules:
+                eva001 = importlib.reload(sys.modules["eva001"])
+            else:
+                eva001 = importlib.import_module("eva001")
+
+            base_dir = str(Path(self.kmz_path).parent)
+            eva001.BASE_DIR = base_dir
+            Path(eva001.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+            def _choose_input_override(_base_dir):
+                return str(self.kmz_path)
+            def _choose_thr_override():
+                return [int(self.slope_percent)]
+
+            if hasattr(eva001, "choose_input"):
+                eva001.choose_input = _choose_input_override
+            if hasattr(eva001, "choose_thresholds"):
+                eva001.choose_thresholds = _choose_thr_override
+
+            self.started_eval.emit()
+            eva001.main()
+
+            out_dir = Path(eva001.OUTPUT_DIR)
+            paths = {
+                "out_dir": str(out_dir),
+                "kmz_out": str(out_dir / "terrain_assessment.kmz"),
+                "env_csv": str(out_dir / "env_summary.csv"),
+                "slope_csv": str(out_dir / "slope_summary.csv"),
+                "final_csv": str(out_dir / "final_usable_summary.csv"),
+            }
+            success = True
+        except Exception as e:
+            self.line.emit(f"[ERROR] {e}")
+            success = False
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            self.finished_eval.emit(success, paths)
+
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Terrain Assessment — Desktop UI")
+        self.resize(1320, 900)
+
+        # Top controls
+        self.folder_btn = QPushButton("Choose Folder…")
+        self.folder_lbl = QLabel("(no folder selected)")
+        self.kmz_combo = QComboBox(); self.kmz_combo.setMinimumWidth(480)
+        self.slope_lbl = QLabel("Slope %:")
+        self.slope_combo = QComboBox(); self.slope_combo.addItems(["5","10","15","20","25"]); self.slope_combo.setCurrentText("10")
+        self.run_btn = QPushButton("Run Assessment"); self.run_btn.setEnabled(False)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(10)
+        top_row.addWidget(self.folder_btn)
+        top_row.addWidget(self.folder_lbl)
+        top_row.addSpacing(12)
+        top_row.addWidget(QLabel("KMZ:"))
+        top_row.addWidget(self.kmz_combo)
+        top_row.addSpacing(12)
+        top_row.addWidget(self.slope_lbl)
+        top_row.addWidget(self.slope_combo)
+        top_row.addStretch()
+        top_row.addWidget(self.run_btn)
+
+        # Execution Log (SectionCard)
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(120)
+        card_log = SectionCard("Execution Log")
+        card_log.addWidget(self.log)
+
+        # Thin progress bar
+        self.progress_thin = QProgressBar()
+        self.progress_thin.setFixedHeight(6)
+        self.progress_thin.setTextVisible(False)
+        self.progress_thin.setRange(0, 100)
+        self.progress_thin.setValue(0)
+        self._progress_timer = QtCore.QTimer(self); self._progress_timer.setInterval(120)
+        self._progress_timer.timeout.connect(self._tick_progress)
+
+        # Donut + Tabela (SectionCards)
+        self.donut_view = QWebEngineView()
+        self.donut_view.setStyleSheet("background:#121214; border-radius:8px;")
+        card_donut = SectionCard("Area Analysis")
+        card_donut.addWidget(self.donut_view)
+
+        self.final_table = QTableView()
+        self.final_model = PandasModel()
+        self.final_table.setModel(self.final_model)
+        self.final_table.setAlternatingRowColors(True)
+        self.final_table.horizontalHeader().setStretchLastSection(True)
+        self.final_table.verticalHeader().setVisible(False)
+        self.final_table.setSortingEnabled(True)
+        card_final = SectionCard("Evaluation Summary")
+        card_final.addWidget(self.final_table)
+
+        lower_row = QHBoxLayout()
+        lower_row.setContentsMargins(0, 0, 0, 0)
+        lower_row.setSpacing(16)
+        lower_row.addWidget(card_donut, 1)
+        lower_row.addWidget(card_final, 2)
+
+        # Central layout (spacings robustos)
+        central = QWidget()
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(14)
+
+        lay.addLayout(top_row)
+        lay.addSpacing(8)
+        lay.addWidget(card_log)
+        lay.addSpacing(12)
+        lay.addWidget(self.progress_thin)
+        lay.addSpacing(16)
+        lay.addLayout(lower_row)
+
+        self.setCentralWidget(central)
+
+        
+        self.folder_btn.clicked.connect(self.choose_folder)
+        self.run_btn.clicked.connect(self.run_evaluation)
+        self.kmz_combo.currentIndexChanged.connect(self._kmz_chosen)
+
+        self._current_kmz = None
+        self._render_donut(0, 0, 1)  # placeholder
+
+    # helpers
+    def _render_donut(self, area_slope, area_env, area_usable):
+        html = _donut_html(area_slope, area_env, area_usable, width=520, height=360)
+        self.donut_view.load(QtCore.QUrl.fromLocalFile(html))
+
+    # UI actions
+    @Slot()
+    def choose_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose a folder with KMZ/KML")
+        if not d:
+            return
+        self.folder_lbl.setText(d)
+        self.populate_kmz_list(d)
+
+    def populate_kmz_list(self, folder):
+        self.kmz_combo.clear()
+        p = Path(folder)
+        patterns = ["*.kmz", "*.KMZ", "*.kml", "*.KML"]
+        files = []
+        for pat in patterns:
+            files.extend(p.rglob(pat))  # procura recursiva
+        files = sorted(set(files), key=lambda x: x.name.lower())
+
+        for f in files:
+            self.kmz_combo.addItem(f.name, str(f))
+        self.run_btn.setEnabled(bool(files))
+        if files:
+            self.kmz_combo.setCurrentIndex(0)
+            self._current_kmz = str(files[0])
+        else:
+            self._current_kmz = None
+
+    @Slot()
+    def _kmz_chosen(self):
+        self._current_kmz = self.kmz_combo.currentData()
+
+    @Slot()
+    def run_evaluation(self):
+        if not self._current_kmz:
+            return
+        self.final_model.setDataFrame(pd.DataFrame())
+        self.progress_thin.setValue(0)
+        self._progress_timer.start()
+        self.log.clear()
+
+        slope_percent = int(self.slope_combo.currentText())
+        self.worker = EvalWorker(self._current_kmz, slope_percent=slope_percent)
+        self.worker.line.connect(self._append_log)
+        self.worker.started_eval.connect(lambda: self._append_log("[INFO] Assessment started…"))
+        self.worker.finished_eval.connect(self._on_finished)
+        self.worker.start()
+
+    @Slot()
+    def _tick_progress(self):
+        v = self.progress_thin.value()
+        if v < 95:
+            self.progress_thin.setValue(v + 1)
+
+    @Slot(str)
+    def _append_log(self, s: str):
+        if not s:
+            return
+        self.log.append(s)
+
+    @Slot(bool, dict)
+    def _on_finished(self, ok: bool, paths: dict):
+        self._progress_timer.stop()
+        self.progress_thin.setValue(100 if ok else 0)
+        if not ok:
+            self._append_log("[ERROR] Assessment failed.")
+            return
+        self._append_log("[OK] Assessment completed.")
+
+       
+        def _safe_df(p):
+            try:
+                return pd.read_csv(p)
+            except Exception:
+                return pd.DataFrame()
+        df_final = _safe_df(paths.get("final_csv"))
+        self.final_model.setDataFrame(df_final)
+
+       
+        def get_sum(df, name):
+            if name in df.columns:
+                return float(pd.to_numeric(df[name], errors="coerce").fillna(0).sum())
+            return 0.0
+        area_slope = get_sum(df_final, "slope_restricted_ha")
+        area_env   = get_sum(df_final, "hard_env_ha")
+        area_usable= get_sum(df_final, "final_usable_ha")
+
+        if area_slope == area_env == area_usable == 0.0:
+            def sum_guess(df, keys):
+                if df.empty: return 0.0
+                cols = [c for c in df.columns if any(k in c.lower() for k in keys)]
+                area_cols = [c for c in cols if "area" in c.lower() or "ha" in c.lower()]
+                cols = area_cols or cols
+                total = 0.0
+                for c in cols:
+                    total += pd.to_numeric(df[c], errors="coerce").fillna(0).sum()
+                return float(total)
+            area_slope  = sum_guess(df_final, ["slope","declive"])
+            area_env    = sum_guess(df_final, ["env","ambient"])
+            area_usable = sum_guess(df_final, ["usable","final","net"])
+
+        self._render_donut(area_slope, area_env, area_usable)
+
+
+# ---------- bootstrap ----------
+def main():
+    app = QApplication(sys.argv)
+    try:
+        settings = QWebEngineSettings.globalSettings()
+    except AttributeError:
+        settings = QWebEngineSettings.defaultSettings() if hasattr(QWebEngineSettings, "defaultSettings") else None
+    if settings:
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+
+    apply_dark_theme(app)
+    w = MainWindow()
+    w.show()
+    return app.exec()
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        QtWidgets.QMessageBox.critical(None, "Startup error", str(e))
+        sys.exit(1)
