@@ -6,10 +6,10 @@ import folium
 from tqdm import tqdm
 
 # === Config ===
-API_KEY = "AIzaSyChYE2BzezP5fJqZI6D-88Xh724Xzd77Sc"  # kept as in your file
+API_KEY =   # kept as in your file
 gmaps = googlemaps.Client(key=API_KEY)
 
-OUTPUT_FOLDER = r"C:\Users\Fabio Silva\OneDrive - Universal Kraft\Desktop\spain scrapping"
+OUTPUT_FOLDER = r"C:"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # === Category catalog ===
@@ -305,3 +305,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
