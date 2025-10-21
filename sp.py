@@ -23,7 +23,7 @@ DATASETS = [
     ("Viesgo",         "viesgo.xlsx",         {}),
     ("REE",            "ree.xlsx",            {"tso": True}),  # Rede de Transporte (assume Availability=Y se faltar)
 
-    # Novos datasets com UTM explícito
+    
     ("Begasa",  "begasa.xlsx",  {"utm_cols": ("Coordenada UTM X", "Coordenada UTM Y")}),
     ("Cuerva",  "cuerva.xlsx",  {"utm_cols": ("Coordenada UTM X", "Coordenada UTM Y")}),
     ("Anselmo", "anselmo.xlsx", {"utm_cols": ("Coordenada UTM X", "Coordenada UTM Y")}),
@@ -64,7 +64,7 @@ def detect_lat_lon(df: pd.DataFrame):
     return lat_col, lon_col
 
 def detect_utm_columns(columns):
-    # Detector genérico para UTM X/Y quando não especificado na fonte
+   
     x_col = y_col = None
     for col in columns:
         s = _norm(col)
@@ -152,7 +152,7 @@ def convert_by_region(easting, northing, region):
             return lat, lon, epsg, "by region"
         if not bbox and (-19.5 <= lon <= 5.5) and (27.0 <= lat <= 44.8):
             return lat, lon, epsg, "by country"
-    # fallback seguro (Espanha continental)
+    
     lon, lat = get_tr("25830").transform(float(easting), float(northing))
     return lat, lon, "25830", "fallback"
 
@@ -304,7 +304,7 @@ def build_kmz(df: pd.DataFrame, kmz_path: Path, name: str, include_nudo: bool = 
         ) + "</table>"
         return f"<![CDATA[{table}]]>"
 
-    # Folder por Região
+   
     for region, g in df.groupby("Region"):
         kml.append(f"<Folder><name>{html.escape(str(region))}</name>")
         for _, row in g.iterrows():
