@@ -1,0 +1,1004 @@
+import os
+import re
+import csv
+import glob
+import json
+import time
+import zipfile
+import tempfile
+import subprocess
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from datetime import datetime
+
+import requests
+import numpy as np
+from tqdm import tqdm
+from fastkml import kml
+import simplekml
+import rasterio
+from rasterio.features import shapes as rio_shapes
+from shapely.geometry import (
+    Polygon, MultiPolygon, Point, LineString, shape, mapping, box
+)
+from shapely.ops import unary_union, transform as shp_transform
+from shapely.validation import make_valid
+from shapely.geometry.base import BaseGeometry
+from pyproj import Transformer, CRS
+
+# ===================== CONFIG =====================
+BASE_DIR = r""
+OUTPUT_DIR = os.path.join(BASE_DIR, "out_terrain")
+BBOX_PAD_DEG = 0.01
+
+AUTO_LINE_BUFFER_METERS = 50
+AUTO_POINT_BUFFER_METERS = 100
+
+# OpenTopography API Key
+_FALLBACK_KEY = ""
+OPENTOPO_API_KEY = (
+    os.environ.get("OPENTOPOGRAPHY_API_KEY")
+    or (
+        open(os.path.join(BASE_DIR, "opentopo_api_key.txt")).read().strip()
+        if os.path.exists(os.path.join(BASE_DIR, "opentopo_api_key.txt"))
+        else None
+    )
+    or _FALLBACK_KEY
+)
+OPENTOPO_URL = (
+    "https://portal.opentopography.org/API/globaldem"
+    "?demtype=COP30&west={w}&south={s}&east={e}&north={n}"
+    "&outputFormat=GTiff&API_Key={k}"
+)
+
+WGS84 = CRS.from_epsg(4326)
+
+# ===================== ENV LAYERS =====================
+ENV_LAYERS = [
+    {"name": "Naturreservat","category": "protected","hard": True,"type": "wfs",
+     "wfs_url": "https://geodata.naturvardsverket.se/naturvardsregistret/wfs","typename_hint": "NR"},
+    {"name": "Nationalparker","category": "protected","hard": True,"type": "wfs",
+     "wfs_url": "https://geodata.naturvardsverket.se/naturvardsregistret/wfs","typename_hint": "NP"},
+    {"name": "Vattenskyddsområde","category": "protected","hard": True,"type": "wfs",
+     "wfs_url": "https://geodata.naturvardsverket.se/naturvardsregistret/wfs","typename_hint": "Vatten"},
+    {"name": "Natura 2000 (all)","category": "protected","hard": True,"type": "wfs",
+     "wfs_url": "https://geodata.naturvardsverket.se/n2000/wfs","typename_hint": "N2000"},
+    {"name": "Sumpskog","category": "marshlands","hard": True,"type": "arcgis",
+     "service_url": "https://geodpags.skogsstyrelsen.se/arcgis/rest/services/Geodataportal/GeodataportalVisaSumpskog/MapServer","layer_name_contains": "Sumpskog"},
+    {"name": "Naturvärde (class 1–3)","category": "wetlands","hard": True,"type": "arcgis",
+     "service_url": "https://geodpags.skogsstyrelsen.se/arcgis/rest/services/Geodataportal/GeodataportalVisaNaturkultur/MapServer","layer_name_contains": "Naturvärden","class_attr": "klass","class_keep": {"1","2","3"}},
+    {"name": "Nyckelbiotop","category": "wetlands","hard": True,"type": "arcgis",
+     "service_url": "https://geodpags.skogsstyrelsen.se/arcgis/rest/services/Geodataportal/GeodataportalVisaNaturkultur/MapServer","layer_name_contains": "Nyckelbiotop"},
+    {"name": "Biotopskydd","category": "protected","hard": True,"type": "arcgis",
+     "service_url": "https://geodpags.skogsstyrelsen.se/arcgis/rest/services/Geodataportal/GeodataportalVisaNaturkultur/MapServer","layer_name_contains": "Biotopskydd"},
+    {"name": "Naturvårdsavtal","category": "protected","hard": True,"type": "arcgis",
+     "service_url": "https://geodpags.skogsstyrelsen.se/arcgis/rest/services/Geodataportal/GeodataportalVisaNaturkultur/MapServer","layer_name_contains": "Naturvårdsavtal"},
+]
+
+
+# --- Sametinget: Reindeer herding areas (Renbetesland / Renskötselområde) ---
+ENV_LAYERS += [
+    {
+        "name": "Reindeer herding (Sametinget – ArcGIS)",
+        "category": "reindeer",
+        "hard": True,
+        "type": "arcgis",
+        "service_url": "https://gisportal.sametinget.se/server/rest/services/Administrativa_ytor_och_gränser/FeatureServer",
+        # Aceita vários nomes prováveis; podes fixar force_layer_id mais abaixo.
+        "layer_name_any": [
+            "Renbetesland",
+            "Renskötselområde",
+            "Renskotselomrade",
+            "Renskötsel",
+            "Rennäringens markanvändning",
+            "Året-runt",
+            "Vinterbetesland",
+            "Flyttleder"
+        ],
+        "force_layer_id": 12
+    }
+]
+
+
+
+ENV_STYLES = {"marshlands": ("7d00ffff", 1.5),
+              "wetlands": ("7d8000ff", 1.5),
+              "protected": ("7d0000ff", 1.8)}
+
+
+# Estilo para camada Renbetesland (reindeer)
+try:
+    ENV_STYLES.update({
+        "reindeer": ("7dff8c00", 1.8)  # laranja semi-transparente (aabbggrr no KML)
+    })
+except NameError:
+    # Caso ENV_STYLES ainda não exista por algum motivo, cria-o minimamente
+    ENV_STYLES = {"reindeer": ("7dff8c00", 1.8)}
+
+
+
+
+# ===================== GDAL/OGR discovery =====================
+from shutil import which
+
+def _first_existing(paths):
+    for p in paths:
+        if p and Path(p).exists():
+            return str(Path(p))
+    return None
+
+def _search_exe(exe_name):
+    w = which(exe_name)
+    if w:
+        return w
+    roots = []
+    for k in ("OSGEO4W_ROOT","OSGEO4W_ROOT_MSYS"):
+        if os.environ.get(k):
+            roots.append(os.environ[k])
+    roots += [r"C:\\OSGeo4W", r"C:\\OSGeo4W64",
+              r"C:\\Program Files\\OSGeo4W", r"C:\\Program Files\\OSGeo4W64"]
+    for pf in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if pf:
+            roots += glob.glob(str(Path(pf) / "QGIS*"))
+    candidates = []
+    for root in roots:
+        candidates += [
+            Path(root)/"bin"/"gdalwarp.exe",
+            Path(root)/"bin"/"gdaldem.exe",
+            Path(root)/"bin"/"ogr2ogr.exe",
+            Path(root)/"apps"/"gdal"/"bin"/"gdalwarp.exe",
+            Path(root)/"apps"/"gdal"/"bin"/"gdaldem.exe",
+            Path(root)/"apps"/"gdal"/"bin"/"ogr2ogr.exe",
+        ]
+    gdalwarp = _first_existing([c for c in candidates if c.name=="gdalwarp.exe"]) or which("gdalwarp.exe")
+    gdaldem  = _first_existing([c for c in candidates if c.name=="gdaldem.exe"])  or which("gdaldem.exe")
+    ogr2ogr  = _first_existing([c for c in candidates if c.name=="ogr2ogr.exe"])  or which("ogr2ogr.exe")
+    return gdalwarp, gdaldem, ogr2ogr
+
+GDALWARP, GDALDEM, OGR2OGR = _search_exe("gdalwarp.exe")
+
+def _try_exec(cmd):
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        return proc.returncode, (proc.stdout or "")+(proc.stderr or "")
+    except Exception as e:
+        return 999, str(e)
+
+def require_cmd(name, path):
+    if not path:
+        raise RuntimeError(f"Missing '{name}'. Install OSGeo4W/QGIS or add it to PATH.")
+    for args in ([path,"--version"], [path,"--help"], [path,"--help-general"]):
+        rc,_ = _try_exec(args)
+        if rc==0: return
+    raise RuntimeError(f"Failed to run '{path}'.")
+
+def run_cmd(args, step_name=None):
+    rc,out = _try_exec(args)
+    if rc!=0:
+        raise RuntimeError(f"Command failed: {' '.join(args)}\nSTDOUT/ERR:\n{out}")
+    return out
+
+# ===================== Common helpers =====================
+def list_candidates(base_dir):
+    items = sorted(list(Path(base_dir).glob("*.kmz")) + list(Path(base_dir).glob("*.kml")))
+    return [str(p) for p in items]
+
+def choose_input(base_dir):
+    cand = list_candidates(base_dir)
+    if not cand:
+        raise FileNotFoundError(f"No KMZ/KML found in {base_dir}.")
+    if len(cand)==1:
+        print(f">> Input selected: {cand[0]}")
+        return cand[0]
+    print(">> Multiple KMZ/KML found. Choose one:")
+    for i,p in enumerate(cand, start=1):
+        print(f"  [{i}] {p}")
+    sel = input(f"Enter number (1-{len(cand)}) [1]: ").strip() or "1"
+    return cand[int(sel)-1]
+
+def choose_thresholds():
+    default=[5,10,15,20,25]
+    s = input("Enter thresholds [5,10,15,20,25]: ").strip()
+    if not s:
+        return default
+    vals=[int(tok) for tok in s.split(",") if tok.strip().isdigit()]
+    return sorted(set(v for v in vals if 0<v<90)) or default
+
+def utm_epsg_from_lonlat(lon, lat):
+    zone=int((lon+180)//6)+1
+    return (32600 if lat>=0 else 32700)+zone
+
+def extract_kml_from_kmz(kmz_path)->str:
+    with zipfile.ZipFile(kmz_path,'r') as z:
+        kml_name=next((n for n in z.namelist() if n.lower().endswith(".kml")), None)
+        if not kml_name:
+            raise ValueError("KMZ has no internal KML file.")
+        tmp=tempfile.NamedTemporaryFile(suffix=".kml", delete=False)
+        with z.open(kml_name) as fsrc, open(tmp.name,"wb") as fdst:
+            fdst.write(fsrc.read())
+        return tmp.name
+
+def load_polygons_via_fastkml(kml_path):
+    with open(kml_path,"rb") as f:
+        doc=f.read()
+    kdoc = kml.KML(); kdoc.from_string(doc)
+    polys,lines,points=[],[],[]
+    def walk(feat):
+        for f in getattr(feat,'features',[]):
+            if hasattr(f,'geometry') and f.geometry is not None:
+                shp = shape(f.geometry.__geo_interface__)
+                gt=shp.geom_type
+                if gt in ("Polygon","MultiPolygon"): polys.append(shp)
+                elif gt in ("LineString","MultiLineString"): lines.append(shp)
+                elif gt in ("Point","MultiPoint"): points.append(shp)
+            walk(f)
+    walk(kdoc)
+    return polys,lines,points
+def load_features_via_ogr(input_path):
+    if not OGR2OGR:
+        return [], [], []
+    tmp_dir = tempfile.gettempdir()
+    tmp_gj = os.path.join(tmp_dir, f"ogr_{next(tempfile._get_candidate_names())}.geojson")
+    if os.path.exists(tmp_gj):
+        os.remove(tmp_gj)
+    run_cmd([OGR2OGR, "-overwrite", "-f", "GeoJSON", tmp_gj, input_path], "ogr2ogr export")
+    with open(tmp_gj, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+    try:
+        os.remove(tmp_gj)
+    except:
+        pass
+    polys, lines, points = [], [], []
+    for feat in gj.get("features", []):
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        shp = shape(geom)
+        gt = shp.geom_type
+        if gt in ("Polygon", "MultiPolygon"):
+            polys.append(shp)
+        elif gt in ("LineString", "MultiLineString"):
+            lines.append(shp)
+        elif gt in ("Point", "MultiPoint"):
+            points.append(shp)
+    return polys, lines, points
+
+
+def build_analysis_polygon(input_path):
+    ext = Path(input_path).suffix.lower()
+    if ext == ".kmz":
+        kml_path = extract_kml_from_kmz(input_path)
+    elif ext == ".kml":
+        kml_path = input_path
+    else:
+        raise ValueError("Provide a KMZ or KML.")
+
+    f_polys, f_lines, f_points = load_polygons_via_fastkml(kml_path)
+    if not f_polys and not f_lines and not f_points:
+        o_polys, o_lines, o_points = load_features_via_ogr(input_path)
+    else:
+        o_polys, o_lines, o_points = [], [], []
+
+    polys = f_polys + o_polys
+    lines = f_lines + o_lines
+    points = f_points + o_points
+
+    if polys:
+        u = unary_union(polys)
+        if u.geom_type == "Polygon":
+            u = MultiPolygon([u])
+        return u
+
+    # Buffer lines/points (WebMercator) se não houver polígonos
+    WEBM = CRS.from_epsg(3857)
+    tf_fwd = Transformer.from_crs(WGS84, WEBM, always_xy=True)
+    tf_back = Transformer.from_crs(WGS84, WGS84, always_xy=True)  # no-op
+
+    def to3857(g):
+        gt = g.geom_type
+        if gt == "Point":
+            X, Y = tf_fwd.transform(float(g.x), float(g.y))
+            return Point(X, Y)
+        elif gt == "LineString":
+            coords = [(float(c[0]), float(c[1])) for c in g.coords]
+            return LineString([tf_fwd.transform(x, y) for (x, y) in coords])
+        elif gt == "Polygon":
+            ext = [(float(c[0]), float(c[1])) for c in g.exterior.coords]
+            holes = [[(float(c[0]), float(c[1])) for c in r.coords] for r in g.interiors]
+            ext_xy = [tf_fwd.transform(x, y) for (x, y) in ext]
+            holes_xy = [[tf_fwd.transform(x, y) for (x, y) in ring] for ring in holes]
+            return Polygon(ext_xy, holes_xy)
+        elif gt.startswith("Multi"):
+            return type(g)([to3857(gg) for gg in g.geoms])
+        return g
+
+    def back4326(g):
+        # já estamos em 4326 ao transformar; manter assinatura
+        return g
+
+    polys_3857 = []
+    if lines and AUTO_LINE_BUFFER_METERS > 0:
+        for ln in lines:
+            polys_3857.append(to3857(ln).buffer(AUTO_LINE_BUFFER_METERS, cap_style=2))
+    if points and AUTO_POINT_BUFFER_METERS > 0:
+        for pt in points:
+            polys_3857.append(to3857(pt).buffer(AUTO_POINT_BUFFER_METERS))
+    if polys_3857:
+        u3857 = unary_union(polys_3857)
+        # não reprojectamos de volta porque só usamos 4326; aqui, para simplificar, assumimos pequena extensão
+        # (se precisares rigor, troca o tf_back para WEBM->WGS84)
+        u4326 = u3857  # placeholder
+        if u4326.geom_type == "Polygon":
+            u4326 = MultiPolygon([u4326])
+        return u4326
+
+    raise ValueError("No polygon AOI and buffers disabled/no lines or points.")
+
+
+def bbox_with_pad(geom, pad=BBOX_PAD_DEG):
+    minx, miny, maxx, maxy = geom.bounds
+    return (minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+
+def stream_download(url, out_file, desc="Downloading"):
+    with requests.get(url, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        with open(out_file, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024, desc=desc
+        ) as bar:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
+
+
+def download_dem(w, s, e, n, out_tif):
+    if not OPENTOPO_API_KEY:
+        raise RuntimeError("Missing OpenTopography API key. Set OPENTOPOGRAPHY_API_KEY or add opentopo_api_key.txt.")
+    url = OPENTOPO_URL.format(w=w, s=s, e=e, n=n, k=OPENTOPO_API_KEY)
+    stream_download(url, out_tif, desc="DEM (COP30)")
+
+
+# ---- Helpers de área (UTM) ----
+def area_ha_from_wgs84_in_epsg(geom4326, epsg):
+    tf = Transformer.from_crs(WGS84, CRS.from_epsg(epsg), always_xy=True)
+    def _proj(x, y, z=None):
+        X, Y = tf.transform(float(x), float(y))
+        return (X, Y)
+    g_utm = shp_transform(_proj, geom4326)
+    return g_utm.area / 10000.0
+
+
+def area_ha_of_utm_geom(geom_utm):
+    return geom_utm.area / 10000.0
+
+
+def write_gpkg_vector(gpkg_path, layer_name, features_geojson):
+    tmp = tempfile.NamedTemporaryFile(suffix=".geojson", delete=False, mode="w", encoding="utf-8")
+    json.dump({"type": "FeatureCollection", "features": features_geojson}, tmp)
+    tmp.close()
+    if not OGR2OGR:
+        raise RuntimeError("ogr2ogr.exe not found.")
+    if not Path(gpkg_path).exists():
+        run_cmd([OGR2OGR, "-f", "GPKG", gpkg_path, tmp.name, "-nln", layer_name], "write GPKG")
+    else:
+        run_cmd([OGR2OGR, "-f", "GPKG", gpkg_path, tmp.name, "-nln", layer_name, "-append"], "append GPKG")
+    os.unlink(tmp.name)
+
+
+def features_from_polys(polys, extra_props=None):
+    feats = []
+    for i, p in enumerate(polys, start=1):
+        feats.append({"type": "Feature", "properties": {"id": i, **(extra_props or {})}, "geometry": mapping(p)})
+    return feats
+
+
+def reproject_shape(geom, src_epsg, dst_crs):
+    tf = Transformer.from_crs(CRS.from_epsg(src_epsg), dst_crs, always_xy=True).transform
+    return shp_transform(tf, geom)
+
+
+def union_to_list(geom):
+    if getattr(geom, "is_empty", True):
+        return []
+    return [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
+
+
+def _ring_xy(ring):
+    return [(float(c[0]), float(c[1])) for c in ring.coords]  # drop Z
+
+
+def _poly_xy_coords(p):
+    return _ring_xy(p.exterior), [_ring_xy(r) for r in p.interiors]
+# === Z-safe: util para descartar Z/M ===
+def _coords2d(seq):
+    """Converte qualquer sequência de coords em [[x,y], ...] (descarta Z/M)."""
+    out = []
+    for c in seq:
+        out.append([float(c[0]), float(c[1])])
+    return out
+
+
+# ===================== HTTP helpers (retry + audit) =====================
+def fetch_with_retry(url, params=None, max_retries=3, timeout=180, method="GET"):
+    for i in range(max_retries):
+        try:
+            if method == "POST":
+                r = requests.post(url, data=params, timeout=timeout)
+            else:
+                r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if i < max_retries - 1:
+                wait = 2 ** i
+                print(f"   retry {i+1}/{max_retries} after error {e}, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+
+
+def log_arcgis_layers_to_html(service_url, html_path):
+    try:
+        meta = fetch_with_retry(f"{service_url}?f=pjson", timeout=60).json()
+        layers = meta.get("layers", [])
+        rows = []
+        for lyr in layers:
+            fields = ", ".join([f.get("name","") for f in lyr.get("fields", [])][:12])
+            rows.append(f"<tr><td>{lyr.get('id')}</td><td>{lyr.get('name')}</td><td>{lyr.get('geometryType')}</td><td>{fields}</td></tr>")
+        table = "<table border='1' cellspacing='0' cellpadding='4'><tr><th>ID</th><th>Name</th><th>Geom</th><th>Fields (sample)</th></tr>" + "".join(rows) + "</table>"
+        with open(html_path, "a", encoding="utf-8") as f:
+            f.write("<h3>Sametinget FeatureServer — layer inventory</h3>")
+            f.write(table)
+    except Exception as e:
+        with open(html_path, "a", encoding="utf-8") as f:
+            f.write(f"<p>Failed to list ArcGIS layers: {e}</p>")
+
+def endpoints_check_html(output_dir):
+    lines = [
+        "<html><head><meta charset='utf-8'><title>Endpoints Check</title></head><body>",
+        "<h1>Environmental Layer Endpoints Check</h1><ul>"
+    ]
+    for cfg in ENV_LAYERS:
+        try:
+            if cfg["type"] == "wfs":
+                caps = fetch_with_retry(f"{cfg['wfs_url']}?service=WFS&request=GetCapabilities")
+                names = re.findall(r"<Name>([^<]+)</Name>", caps.text)
+                hint = cfg.get("typename_hint", "")
+                match = [n for n in names if hint.lower() in n.lower()] if hint else names
+                detail = f"WFS ok. Types: {len(names)}; hint='{hint}' match='{match[0] if match else 'n/a'}'"
+                status = "OK"
+            else:
+                meta = fetch_with_retry(f"{cfg['service_url']}?f=pjson").json()
+                layers = meta.get("layers", [])
+                any_names = [s.lower() for s in cfg.get("layer_name_any", [])]
+                forced = cfg.get("force_layer_id")
+                if forced is not None:
+                    ids = [L.get('id') for L in layers if int(L.get('id', -1)) == int(forced)]
+                    detail = f"ArcGIS ok. Forced ID: {forced} -> found={ids}"
+                else:
+                    def norm(s): return (s or "").lower().replace("ö","o").replace("å","a").replace("ä","a")
+                    ids = [L.get('id') for L in layers if any(norm(q) in norm(L.get('name','')) for q in any_names)] if any_names else []
+                    detail = f"ArcGIS ok. Layers: {len(layers)}; name_any -> {ids[:6]}"
+                status = "OK"
+        except Exception as e:
+            status, detail = "ERROR", f"{e}"
+        lines.append(f"<li><b>{cfg['name']}</b> → {status}<br><small>{detail}</small></li>")
+    lines.append("</ul></body></html>")
+    out = os.path.join(output_dir, "endpoints_check.html")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    # Also append inventory for Sametinget ArcGIS to the same HTML (helpful for picking layer ID)
+    try:
+        for cfg in ENV_LAYERS:
+            if cfg.get("type") == "arcgis" and "sametinget" in (cfg.get("name","").lower() + cfg.get("service_url","").lower()):
+                log_arcgis_layers_to_html(cfg["service_url"], out)
+    except Exception:
+        pass
+    print(f">> Endpoint report saved: {out}")
+
+
+# ===================== WFS / ArcGIS helpers =====================
+def wfs_list_typenames(wfs_url):
+    r = fetch_with_retry(f"{wfs_url}?service=WFS&request=GetCapabilities", timeout=120)
+    root = ET.fromstring(r.text)
+    names = [el.text for el in root.findall(".//{http://www.opengis.net/wfs/2.0}Name")]
+    if not names:
+        names = re.findall(r"<Name>([^<]+)</Name>", r.text)
+    return names
+
+
+def resolve_wfs_typename(wfs_url, hint):
+    names = wfs_list_typenames(wfs_url)
+    cand = [n for n in names if hint.lower() in n.lower()] if hint else names
+    return cand[0] if cand else (names[0] if names else None)
+
+
+def wfs_get_geojson(wfs_url, typename, bbox4326):
+    """
+    Tenta JSON diretamente (GeoJSON); se precisares de fallback GML->GeoJSON,
+    podes acrescentar via ogr2ogr (não incluído aqui para simplificar).
+    """
+    fmt_candidates = ["application/json", "json", "GeoJSON", "application/vnd.geo+json"]
+    params_base = {
+        "service": "WFS", "version": "2.0.0", "request": "GetFeature",
+        "typeNames": typename, "srsName": "EPSG:4326",
+        "bbox": f"{bbox4326[0]},{bbox4326[1]},{bbox4326[2]},{bbox4326[3]},EPSG:4326"
+    }
+    for fmt in fmt_candidates:
+        try:
+            params = {**params_base, "outputFormat": fmt}
+            r = fetch_with_retry(wfs_url, params=params, timeout=180)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "json" in ctype:
+                return r.json()
+            # alguns servidores não definem content-type bem
+            return r.json()
+        except Exception:
+            continue
+    raise RuntimeError("WFS did not return JSON; add GML fallback if needed.")
+
+
+def arcgis_list_layers(service_url):
+    r = fetch_with_retry(f"{service_url}?f=pjson", timeout=60)
+    return r.json().get("layers", [])
+
+
+def resolve_arcgis_layer_id(service_url, name_contains):
+    # legacy helper retained for compatibility
+    layers = arcgis_list_layers(service_url)
+    cand = [L for L in layers if name_contains.lower() in L["name"].lower()]
+    return cand[0]["id"] if cand else None
+
+def resolve_arcgis_layer_from_cfg(cfg):
+    service_url = cfg["service_url"]
+    forced = cfg.get("force_layer_id")
+    if forced is not None:
+        return int(forced)
+    layers = arcgis_list_layers(service_url)
+    def norm(s): return (s or "").lower().replace("ö","o").replace("å","a").replace("ä","a")
+    any_names = [s.lower() for s in cfg.get("layer_name_any", [])]
+    if any_names:
+        for L in layers:
+            lname = norm(L.get("name",""))
+            if any(norm(q) in lname for q in any_names):
+                return L.get("id")
+    # fallback to single contains if present
+    if cfg.get("layer_name_contains"):
+        return resolve_arcgis_layer_id(service_url, cfg.get("layer_name_contains",""))
+    # final fallback: first polygon layer that has common fields
+    for L in layers:
+        if (L.get("geometryType","").endswith("Polygon")):
+            fields = [f.get("name","").lower() for f in L.get("fields", [])]
+            if any(k in fields for k in ("klass","typ","kategori","sameby")):
+                return L.get("id")
+    return None
+
+    layers = arcgis_list_layers(service_url)
+    cand = [L for L in layers if name_contains.lower() in L["name"].lower()]
+    return cand[0]["id"] if cand else None
+
+
+# === ArcGIS /query robusto (POST + split multipolygon + envelope + Z-safe) ===
+def _geom_precision(geom: BaseGeometry, ndp=6):
+    """Reduz precisão de coordenadas (e descarta Z/M)."""
+    if geom.is_empty:
+        return geom
+    def rnd(x): return float(f"{x:.{ndp}f}")
+    if geom.geom_type == "Polygon":
+        ext = _coords2d(geom.exterior.coords)
+        ext = [(rnd(x), rnd(y)) for x, y in ext]
+        holes = [[(rnd(x), rnd(y)) for x, y in _coords2d(r.coords)] for r in geom.interiors]
+        return Polygon(ext, holes)
+    if geom.geom_type == "MultiPolygon":
+        return MultiPolygon([_geom_precision(p, ndp) for p in geom.geoms])
+    return geom.simplify(0)
+
+
+def _aoi_parts(geom4326: BaseGeometry):
+    if geom4326.geom_type == "Polygon":
+        return [geom4326]
+    if geom4326.geom_type == "MultiPolygon":
+        return [g for g in geom4326.geoms if not g.is_empty]
+    return []
+
+
+def arcgis_query_geojson(service_url, layer_id, aoi_geom4326: BaseGeometry):
+    """
+    Consulta robusta ao ArcGIS REST /query:
+    - usa POST (evita URL gigante)
+    - divide AOI MultiPolygon em partes
+    - se geometria for muito grande, usa envelope (bbox) e intersecta localmente
+    - descarta Z/M ao construir rings
+    """
+    url = f"{service_url}/{layer_id}/query"
+    parts = _aoi_parts(aoi_geom4326)
+    if not parts:
+        return {"type": "FeatureCollection", "features": []}
+
+    features_all = []
+
+    def _post_query(geom_obj, as_envelope=False):
+        if as_envelope:
+            minx, miny, maxx, maxy = geom_obj.bounds
+            geometry = json.dumps({"xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy})
+            gtype = "esriGeometryEnvelope"
+        else:
+            rings = [_coords2d(geom_obj.exterior.coords)] + [_coords2d(r.coords) for r in geom_obj.interiors]
+            geometry = json.dumps({"rings": rings, "spatialReference": {"wkid": 4326}})
+            gtype = "esriGeometryPolygon"
+        params = {
+            "where": "1=1",
+            "geometry": geometry,
+            "geometryType": gtype,
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": 4326,
+            "f": "geojson",
+            "geometryPrecision": 6
+        }
+        r = fetch_with_retry(url, params=params, timeout=240, method="POST")
+        return r.json()
+
+    for poly in parts:
+        poly_p = _geom_precision(poly, 6)
+        try:
+            vcount = len(poly_p.exterior.coords) + sum(len(r.coords) for r in poly_p.interiors)
+            use_envelope = vcount > 5000
+            gj = _post_query(poly_p, as_envelope=use_envelope)
+        except Exception:
+            gj = _post_query(poly_p, as_envelope=True)
+        feats = gj.get("features", [])
+        features_all.extend(feats)
+
+    # deduplicar por (id,bbox)
+    seen = set()
+    unique = []
+    for f in features_all:
+        geom = f.get("geometry")
+        bbox = None
+        try:
+            shp = shape(geom)
+            bbox = tuple(round(x, 6) for x in shp.bounds)
+        except Exception:
+            bbox = None
+        fid = f.get("id") or f.get("properties", {}).get("OBJECTID") or json.dumps(f.get("properties", {}), sort_keys=True)[:200]
+        key = (fid, bbox)
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return {"type": "FeatureCollection", "features": unique}
+
+
+def features_to_polygons(geojson_fc, filter_func=None):
+    polys = []
+    for f in geojson_fc.get("features", []):
+        g = f.get("geometry")
+        if not g:
+            continue
+        shp_ = make_valid(shape(g))
+        if shp_.is_empty:
+            continue
+        props = f.get("properties", {})
+        if filter_func and not filter_func(props):
+            continue
+        if shp_.geom_type in ("Polygon", "MultiPolygon"):
+            polys.append(shp_)
+    return polys
+# ===================== MAIN =====================
+def main():
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    require_cmd("ogr2ogr", OGR2OGR)
+    require_cmd("gdalwarp", GDALWARP)
+    require_cmd("gdaldem", GDALDEM)
+
+    input_path = choose_input(BASE_DIR)
+    thresholds = choose_thresholds()
+
+    print(">> Building AOI polygon(s)…")
+    analysis_polys = build_analysis_polygon(input_path)  # MultiPolygon
+    west, south, east, north = bbox_with_pad(analysis_polys)
+
+    # Auditoria endpoints
+    print(">> Checking endpoints…")
+    endpoints_check_html(OUTPUT_DIR)
+
+    # ============ DEM ============
+    dem_path = os.path.join(OUTPUT_DIR, "dem_cop30.tif")
+    print(">> Downloading DEM…")
+    download_dem(west, south, east, north, dem_path)
+
+    # cutline KML
+    tmp_kml = tempfile.NamedTemporaryFile(suffix=".kml", delete=False).name
+    kml_out = simplekml.Kml()
+    def add_kml_poly(p):
+        ext, holes = _poly_xy_coords(p)
+        poly = kml_out.newpolygon()
+        poly.outerboundaryis = ext
+        poly.innerboundaryis = holes
+    for p in (analysis_polys.geoms if analysis_polys.geom_type == "MultiPolygon" else [analysis_polys]):
+        add_kml_poly(p)
+    kml_out.save(tmp_kml)
+
+    # clip DEM
+    clipped_dem = os.path.join(OUTPUT_DIR, "dem_clip.tif")
+    run_cmd(
+        [GDALWARP, "-cutline", tmp_kml, "-crop_to_cutline", "-dstnodata", "nan", dem_path, clipped_dem],
+        "clip DEM"
+    )
+
+    # reprojetar para UTM (centroide)
+    centroid = (analysis_polys.centroid if analysis_polys.geom_type == "MultiPolygon" else analysis_polys.centroid)
+    epsg_utm = utm_epsg_from_lonlat(centroid.x, centroid.y)
+    dem_clip_utm = os.path.join(OUTPUT_DIR, f"dem_clip_utm_{epsg_utm}.tif")
+    run_cmd(
+        [GDALWARP, "-t_srs", f"EPSG:{epsg_utm}", "-r", "bilinear", "-dstnodata", "nan", clipped_dem, dem_clip_utm],
+        "reproject to UTM"
+    )
+
+    # slope (%)
+    slope_tif = os.path.join(OUTPUT_DIR, "slope_percent.tif")
+    run_cmd([GDALDEM, "slope", dem_clip_utm, slope_tif, "-p", "-compute_edges"], "compute slope (%)")
+
+    # ler raster slope
+    with rasterio.open(slope_tif) as src:
+        arr = src.read(1, masked=True).astype("float32")
+        transform = src.transform
+    finite = np.isfinite(arr.filled(np.nan))
+    vals = arr.filled(np.nan)
+    if finite.any():
+        print(f"   Slope % stats — min:{np.nanmin(vals):.3f} mean:{np.nanmean(vals):.3f} max:{np.nanmax(vals):.3f}")
+
+    # ============ ENVIRONMENTAL ============
+    print(">> Fetching environmental layers…")
+    bbox = (west, south, east, north)
+    analysis_polys_simpl = analysis_polys.simplify(0.0001, preserve_topology=True)
+
+    env_results = []  # [{name, category, hard, polys:[WGS84 Polygons]}]
+    for cfg in ENV_LAYERS:
+        try:
+            if cfg["type"] == "wfs":
+                tname = cfg.get("typename") or resolve_wfs_typename(cfg["wfs_url"], cfg.get("typename_hint", ""))
+                if not tname:
+                    print(f"   - {cfg['name']}: typename not found (skipping).")
+                    continue
+                gj = wfs_get_geojson(cfg["wfs_url"], tname, bbox)
+                polys_all = features_to_polygons(gj, None)
+
+            elif cfg["type"] == "arcgis":
+                lid = resolve_arcgis_layer_from_cfg(cfg)
+                if lid is None:
+                    print(f"   - {cfg['name']}: layer id not found (skipping).")
+                    continue
+                gj = arcgis_query_geojson(cfg["service_url"], lid, analysis_polys_simpl)
+                klass_attr, keep = cfg.get("class_attr"), cfg.get("class_keep")
+                filt = (lambda p: str(p.get(klass_attr, "")).strip() in keep) if (klass_attr and keep) else None
+                polys_all = features_to_polygons(gj, filter_func=filt)
+
+            else:
+                continue
+
+            # interseção local por segurança (em caso de envelope fallback)
+            inters = []
+            for g in polys_all:
+                try:
+                    gi = g.intersection(analysis_polys_simpl)
+                except Exception:
+                    gi = make_valid(g).intersection(analysis_polys_simpl)
+                if not gi.is_empty:
+                    if gi.geom_type == "Polygon":
+                        inters.append(gi)
+                    elif gi.geom_type == "MultiPolygon":
+                        inters.extend([p for p in gi.geoms if not p.is_empty])
+
+            if inters:
+                env_results.append({"name": cfg["name"], "category": cfg["category"], "hard": cfg["hard"], "polys": inters})
+                print(f"   - {cfg['name']}: {len(inters)} polygon(s) within AOI")
+            else:
+                print(f"   - {cfg['name']}: no overlap with AOI")
+        except Exception as e:
+            print(f"   - {cfg['name']}: error → {e}")
+
+    # unions por categoria e HARD
+    env_unions = {}
+    hard_union_wgs84 = MultiPolygon([])
+    for r in env_results:
+        u = unary_union(r["polys"])
+        parts = [u] if u.geom_type == "Polygon" else list(u.geoms)
+        env_unions[r["category"]] = env_unions.get(r["category"], []) + parts
+        if r["hard"]:
+            hard_union_wgs84 = unary_union([hard_union_wgs84, u])
+
+    # áreas (UTM) para HARD
+    hard_union_utm = reproject_shape(hard_union_wgs84, 4326, CRS.from_epsg(epsg_utm)) if not hard_union_wgs84.is_empty else hard_union_wgs84
+    hard_area_ha = round(area_ha_of_utm_geom(hard_union_utm), 4) if not getattr(hard_union_utm, "is_empty", True) else 0.0
+
+    # área base AOI
+    aoi_area_ha = round(area_ha_from_wgs84_in_epsg(analysis_polys_simpl, epsg_utm), 4)
+
+    # ============ PER-THRESHOLD ============
+    per_thr = []
+    for thr in thresholds:
+        print(f">> Threshold {thr}% — classify & polygonize")
+        gt_mask = (vals > thr) & finite
+        le_mask = (vals <= thr) & finite
+
+        gt_polys = []
+        for geom, val in rio_shapes(gt_mask.astype("uint8"), mask=gt_mask, transform=transform):
+            if val == 1:
+                shp = shape(geom)
+                if shp.area > 0:
+                    gt_polys.append(shp)
+        gt_union = unary_union(gt_polys) if gt_polys else MultiPolygon([])
+
+        le_polys = []
+        for geom, val in rio_shapes(le_mask.astype("uint8"), mask=le_mask, transform=transform):
+            if val == 1:
+                shp = shape(geom)
+                if shp.area > 0:
+                    le_polys.append(shp)
+        le_union = unary_union(le_polys) if le_polys else MultiPolygon([])
+
+        steep_area_ha = round(area_ha_of_utm_geom(gt_union), 4) if not getattr(gt_union, "is_empty", True) else 0.0
+        slope_usable_ha = max(round(aoi_area_ha - steep_area_ha, 4), 0.0)
+
+        gt_union_wgs84 = reproject_shape(gt_union, epsg_utm, WGS84) if not getattr(gt_union, "is_empty", True) else MultiPolygon([])
+        comb_union = unary_union([gt_union_wgs84, hard_union_wgs84])
+        comb_union_utm = reproject_shape(comb_union, 4326, CRS.from_epsg(epsg_utm)) if not comb_union.is_empty else comb_union
+        total_restricted_ha = round(area_ha_of_utm_geom(comb_union_utm), 4) if not comb_union_utm.is_empty else round(hard_area_ha, 4)
+        final_usable_ha = max(round(aoi_area_ha - total_restricted_ha, 4), 0.0)
+        final_usable_pct = round((final_usable_ha / aoi_area_ha) * 100.0, 2) if aoi_area_ha > 0 else 0.0
+
+        per_thr.append({
+            "thr": thr,
+            "gt_union_wgs84": gt_union_wgs84,
+            "le_union_wgs84": reproject_shape(le_union, epsg_utm, WGS84) if not getattr(le_union, "is_empty", True) else MultiPolygon([]),
+            "steep_area_ha": steep_area_ha,
+            "slope_usable_ha": slope_usable_ha,
+            "total_restricted_ha": total_restricted_ha,
+            "final_usable_ha": final_usable_ha,
+            "final_usable_pct": final_usable_pct,
+        })
+
+    # ============ EXPORTS ============
+    print(">> Writing outputs…")
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    # KMZ
+    kmz_path = os.path.join(OUTPUT_DIR, "terrain_assessment.kmz")
+    tmp_kml_comb = kmz_path.replace(".kmz", ".kml")
+    kml_doc = simplekml.Kml()
+
+    # ENV folders
+    env_folders = {cat: kml_doc.newfolder(name=f"ENV — {cat}") for cat in ENV_STYLES.keys()}
+    for cat, geoms in env_unions.items():
+        color, width = ENV_STYLES.get(cat, ("7dffffff", 1.5))
+        st = simplekml.Style()
+        st.polystyle.color = color
+        st.linestyle.width = width
+        for g in geoms:
+            gg = g if g.is_valid else make_valid(g)
+            for p in ([gg] if gg.geom_type == "Polygon" else list(gg.geoms)):
+                ext, holes = _poly_xy_coords(p)
+                poly = env_folders.get(cat, kml_doc).newpolygon()
+                poly.outerboundaryis = ext
+                poly.innerboundaryis = holes
+                poly.style = st
+
+    # Slope folders
+    for rec in per_thr:
+        thr = rec["thr"]
+        style_le = simplekml.Style(); style_le.polystyle.color = "7d00ff00"; style_le.linestyle.width = 1.5
+        style_gt = simplekml.Style(); style_gt.polystyle.color = "7d0000ff"; style_gt.linestyle.width = 1.5
+        folder_thr = kml_doc.newfolder(name=f"Slope — threshold {thr}%")
+        f_le = folder_thr.newfolder(name=f"≤ {thr}%")
+        f_gt = folder_thr.newfolder(name=f"> {thr}%")
+        for p in union_to_list(rec["le_union_wgs84"]):
+            ext, holes = _poly_xy_coords(p)
+            poly = f_le.newpolygon(); poly.outerboundaryis = ext; poly.innerboundaryis = holes; poly.style = style_le
+        for p in union_to_list(rec["gt_union_wgs84"]):
+            ext, holes = _poly_xy_coords(p)
+            poly = f_gt.newpolygon(); poly.outerboundaryis = ext; poly.innerboundaryis = holes; poly.style = style_gt
+
+    kml_doc.save(tmp_kml_comb)
+    with zipfile.ZipFile(kmz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(tmp_kml_comb, arcname=os.path.basename(tmp_kml_comb))
+    os.remove(tmp_kml_comb)
+
+    # GPKG
+    gpkg_path = os.path.join(OUTPUT_DIR, "terrain_assessment.gpkg")
+    aoi_feats = [{"type": "Feature", "properties": {"name": "AOI"}, "geometry": mapping(analysis_polys_simpl)}]
+    write_gpkg_vector(gpkg_path, "aoi", aoi_feats)
+    for cat, geoms in env_unions.items():
+        feats = [{"type": "Feature", "properties": {"category": cat}, "geometry": mapping(g)} for g in geoms]
+        if feats:
+            write_gpkg_vector(gpkg_path, f"env_{cat}", feats)
+    for rec in per_thr:
+        thr = rec["thr"]
+        if union_to_list(rec["gt_union_wgs84"]):
+            write_gpkg_vector(gpkg_path, f"slope_gt_{thr}", features_from_polys(union_to_list(rec["gt_union_wgs84"]), {"thr": thr}))
+        if union_to_list(rec["le_union_wgs84"]):
+            write_gpkg_vector(gpkg_path, f"slope_le_{thr}", features_from_polys(union_to_list(rec["le_union_wgs84"]), {"thr": thr}))
+
+    # CSVs
+    slope_summary_csv = os.path.join(OUTPUT_DIR, "slope_summary.csv")
+    with open(slope_summary_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["threshold_pct", "aoi_area_ha", "steep_area_ha", "usable_area_ha", "usable_pct"])
+        w.writeheader()
+        for rec in per_thr:
+            slope_usable_pct = round((rec["slope_usable_ha"] / aoi_area_ha) * 100.0, 2) if aoi_area_ha > 0 else 0.0
+            w.writerow({"threshold_pct": rec["thr"], "aoi_area_ha": aoi_area_ha, "steep_area_ha": rec["steep_area_ha"],
+                        "usable_area_ha": rec["slope_usable_ha"], "usable_pct": slope_usable_pct})
+
+    env_summary_csv = os.path.join(OUTPUT_DIR, "env_summary.csv")
+    with open(env_summary_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["category", "area_ha", "counts"])
+        w.writeheader()
+        for cat, geoms in env_unions.items():
+            u = unary_union(geoms) if geoms else MultiPolygon([])
+            u_utm = reproject_shape(u, 4326, CRS.from_epsg(epsg_utm))
+            a_ha = round(area_ha_of_utm_geom(u_utm), 4) if not u_utm.is_empty else 0.0
+            w.writerow({"category": cat, "area_ha": a_ha, "counts": len(geoms)})
+
+    final_summary_csv = os.path.join(OUTPUT_DIR, "final_usable_summary.csv")
+    with open(final_summary_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "threshold_pct","aoi_area_ha","slope_restricted_ha","hard_env_ha",
+            "total_restricted_ha","final_usable_ha","final_usable_pct"
+        ])
+        w.writeheader()
+        for rec in per_thr:
+            w.writerow({
+                "threshold_pct": rec["thr"],
+                "aoi_area_ha": aoi_area_ha,
+                "slope_restricted_ha": rec["steep_area_ha"],
+                "hard_env_ha": hard_area_ha,
+                "total_restricted_ha": rec["total_restricted_ha"],
+                "final_usable_ha": rec["final_usable_ha"],
+                "final_usable_pct": rec["final_usable_pct"],
+            })
+
+    # HTML
+    html_path = os.path.join(OUTPUT_DIR, "terrain_assessment.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(f"<h2>Terrain Assessment — Slopes + Environmental</h2>")
+        f.write(f"<p>Generated at {datetime.utcnow().isoformat()}Z</p>")
+        f.write(f"<p>AOI area (ha): <b>{aoi_area_ha}</b> — HARD environmental area (ha): <b>{hard_area_ha}</b></p>")
+        f.write("<h3>Per-threshold (slopes only)</h3>")
+        f.write("<table border='1' cellspacing='0' cellpadding='4'>")
+        f.write("<tr><th>Threshold (%)</th><th>Steep >thr (ha)</th><th>Usable by slope (ha)</th><th>Usable by slope (%)</th></tr>")
+        for rec in per_thr:
+            pct = round((rec["slope_usable_ha"] / aoi_area_ha) * 100.0, 2) if aoi_area_ha else 0.0
+            f.write(f"<tr><td>{rec['thr']}</td><td>{rec['steep_area_ha']}</td><td>{rec['slope_usable_ha']}</td><td>{pct}%</td></tr>")
+        f.write("</table>")
+        f.write("<h3>Final usable area (Slopes + HARD environmental)</h3>")
+        f.write("<table border='1' cellspacing='0' cellpadding='4'>")
+        f.write("<tr><th>Threshold (%)</th><th>Total restricted (ha)</th><th>Final usable (ha)</th><th>Final usable (%)</th></tr>")
+        for rec in per_thr:
+            f.write(f"<tr><td>{rec['thr']}</td><td>{rec['total_restricted_ha']}</td><td>{rec['final_usable_ha']}</td><td>{rec['final_usable_pct']}%</td></tr>")
+        f.write("</table>")
+
+    try:
+        if os.path.exists(tmp_kml):
+            os.remove(tmp_kml)
+    except:
+        pass
+
+    print("\n=== DONE ===")
+    print(f"- KMZ:        {kmz_path}")
+    print(f"- GPKG:       {gpkg_path}")
+    print(f"- CSVs:       {slope_summary_csv}, {env_summary_csv}, {final_summary_csv}")
+    print(f"- HTML:       {html_path}")
+    print(f"- Rasters:    {dem_path}, {clipped_dem}, {dem_clip_utm}, {slope_tif}")
+    print(f"- Audit:      {os.path.join(OUTPUT_DIR, 'endpoints_check.html')}")
+
+
+# ===================== RUN =====================
+if __name__ == "__main__":
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    main()
