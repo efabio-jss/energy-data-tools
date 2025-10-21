@@ -191,6 +191,5 @@ def main() -> None:
     print("- dataset.csv, anomalies_top20.csv")
     print("- residuals_vs_pred.png, residuals_rz_hist.png, true_vs_pred.png")
 
-
 if __name__ == "__main__":
     main()
